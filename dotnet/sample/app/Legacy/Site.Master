@@ -1,0 +1,9 @@
+<%@ Master Language="C#" AutoEventWireup="true" CodeBehind="Site.Master.cs" Inherits="Shop.Legacy.SiteMaster" %>
+<html>
+<body>
+    <form id="form1" runat="server">
+        <asp:HyperLink ID="lnkCustomers" runat="server" NavigateUrl="~/Customers/Edit.aspx" Text="Clienti" />
+        <asp:ContentPlaceHolder ID="MainContent" runat="server" />
+    </form>
+</body>
+</html>

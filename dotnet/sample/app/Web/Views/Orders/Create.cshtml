@@ -1,0 +1,10 @@
+@model Shop.Web.Models.OrderVm
+@{ ViewBag.Title = "Nuovo ordine"; }
+@using (Html.BeginForm("Create", "Orders"))
+{
+    @Html.AntiForgeryToken()
+    @Html.DropDownListFor(m => m.CustomerId, (SelectList)ViewBag.Customers)
+    @Html.EditorFor(m => m.Lines)
+    @Html.ValidationMessageFor(m => m.Lines)
+    <button type="submit">Salva</button>
+}

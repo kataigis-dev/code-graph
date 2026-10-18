@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!--
+      net10.0 funziona anche su solution legacy .NET Framework: MSBuildWorkspace (Roslyn 4.9+)
+      carica i progetti in un BuildHost esterno (BuildHost-net472 per i csproj "vecchio stile"),
+      che usa l'MSBuild di Visual Studio / Build Tools. Serve quindi Windows con VS o Build Tools installati.
+      Non cambiare TargetFramework in net48: il codice usa API assenti in .NET Framework e il caricamento
+      dei progetti avviene comunque nel BuildHost, qualunque sia il framework dell'estrattore.
+    -->
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>roslyn-graph</AssemblyName>
+    <RootNamespace>RoslynGraph</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      Aggiorna alle ultime versioni stabili disponibili su NuGet (minimo 4.9, che introduce il BuildHost esterno:
+      con esso non serve Microsoft.Build.Locator). La 4.14 tira dentro Microsoft.Build.Tasks.Core 17.7.2,
+      vulnerabile (CVE-2025-26646): dopo ogni aggiornamento controlla con dotnet list package,
+      opzioni vulnerable e include-transitive (il doppio trattino non e' ammesso nei commenti XML).
+    -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="5.9.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="5.9.0" />
+  </ItemGroup>
+
+</Project>

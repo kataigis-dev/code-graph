@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Genera sample/graph.sample.json eseguendo l'estrattore vero sull'app d'esempio.
+    Non serve Windows ne' Visual Studio: i progetti si caricano in una AdhocWorkspace e le librerie
+    .NET Framework (System.Web, EF6) sono sostituite da stub minimi in stubs/.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../extractor/RoslynGraph.csproj" />
+    <Compile Remove="stubs/**" />
+    <None Include="stubs/**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

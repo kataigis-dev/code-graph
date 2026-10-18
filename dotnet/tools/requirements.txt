@@ -1,0 +1,3 @@
+networkx>=3.0
+anthropic>=0.40  # solo per enrich.py --provider anthropic
+# openai>=1.0    # solo per enrich.py --provider openai (Azure OpenAI, vLLM on-premise, ...)

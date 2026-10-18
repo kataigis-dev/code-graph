@@ -1,0 +1,8 @@
+@model Shop.Data.Order
+<h2>Ordine @Model.Id</h2>
+<p>Totale: @Model.Total</p>
+@if (User.IsInRole("Manager") && Model.Status == "PendingApproval")
+{
+    @Html.ActionLink("Approva", "Approve", "Orders", new { id = Model.Id }, null)
+}
+@Html.ActionLink("Nuovo", "Create")
