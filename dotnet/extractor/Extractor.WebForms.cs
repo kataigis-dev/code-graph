@@ -5,7 +5,7 @@ using Microsoft.CodeAnalysis;
 namespace RoslynGraph;
 
 /// <summary>
-/// Passata 5: Web Forms. Pagine (.aspx), controlli utente (.ascx), master page (.master), servizi (.asmx),
+/// Passata 5: Web Forms. Pagine (.aspx), controlli utente (.ascx), master page (.master), servizi (.asmx, .svc),
 /// handler (.ashx), Global.asax e regole di autorizzazione dei web.config.
 /// Il markup si legge con espressioni regolari, come le viste Razor: controlli server, eventi, validatori,
 /// origini dati, link e redirect. Il code-behind e' gia' nel grafo dalle passate 1 e 3: qui lo si collega alla pagina.
@@ -25,6 +25,7 @@ public sealed partial class Extractor
     private readonly List<PendingPageRedirect> _pendingPageRedirects = new();
     private readonly List<PendingEvent> _pendingEvents = new();
     private readonly List<(string Project, string Template, string Page)> _pendingPageRoutes = new();
+    private readonly Dictionary<string, List<AuthScope>> _authScopes = new();                              // progetto -> regole web.config
 
     private sealed record PendingPageRedirect(string FromMethod, string? TypeId, string Project, string Url, int Line);
     private sealed record PendingEvent(string TypeId, string Control, string Event, string Handler);
@@ -32,10 +33,10 @@ public sealed partial class Extractor
     private sealed record ParsedPage(SourceFile File, string Text, int[] Lines, Dictionary<string, string> Attrs, INamedTypeSymbol? Type);
 
     private static readonly HashSet<string> WebFormsExtensions = new(StringComparer.OrdinalIgnoreCase)
-        { ".aspx", ".ascx", ".master", ".asmx", ".ashx", ".asax" };
+        { ".aspx", ".ascx", ".master", ".asmx", ".ashx", ".asax", ".svc" };
 
     private static readonly HashSet<string> MainDirectives = new(StringComparer.OrdinalIgnoreCase)
-        { "Page", "Control", "Master", "WebService", "WebHandler", "Application" };
+        { "Page", "Control", "Master", "WebService", "WebHandler", "Application", "ServiceHost" };
 
     // override del ciclo di vita: entry point della pagina anche senza attributi On* nel markup
     private static readonly HashSet<string> LifecycleOverrides = new()
@@ -46,6 +47,7 @@ public sealed partial class Extractor
 
     private void PassWebForms()
     {
+        foreach (var (p, _) in _units) _authScopes[p.Name] = LoadAuthorization(p);
         var files = new List<SourceFile>();
         foreach (var (p, _) in _units)
             foreach (var (full, projRel) in ProjectFiles(p, f => WebFormsExtensions.Contains(Path.GetExtension(f))))
@@ -59,8 +61,7 @@ public sealed partial class Extractor
         if (files.Count == 0) return;
 
         foreach (var (_, ts) in _types) _typesByFqn.TryAdd(ts.ToDisplayString(), ts);
-        var auth = new Dictionary<string, List<AuthScope>>();
-        foreach (var (p, _) in _units) auth[p.Name] = LoadAuthorization(p);
+        var auth = _authScopes;
 
         // prima code-behind e rotte di tutte le pagine: link e redirect possono puntare a pagine non ancora lette
         var pages = new List<ParsedPage>();
@@ -105,7 +106,7 @@ public sealed partial class Extractor
 
     private INamedTypeSymbol? CodeBehindType(Dictionary<string, string> attrs, GraphNode n)
     {
-        var name = attrs.GetValueOrDefault("Inherits") ?? attrs.GetValueOrDefault("Class");
+        var name = attrs.GetValueOrDefault("Inherits") ?? attrs.GetValueOrDefault("Class") ?? attrs.GetValueOrDefault("Service");
         if (string.IsNullOrWhiteSpace(name)) return null;   // pagina con solo codice inline (<script runat="server">)
         if (FindType(name) is { } t) return t;
         // CodeFile = progetto "web site": il code-behind non e' compilato in un csproj e non e' nel grafo
@@ -148,6 +149,13 @@ public sealed partial class Extractor
                 foreach (var m in MethodsInHierarchy(type).Where(m => m.HasAttr("WebMethod")))
                     if (Id(m.Norm()) is { } mid)
                         Route("asmx", ["POST"], $"{pf.ProjRel}/{m.Name}", stem, m.Name, auth.Concat(m.Authorization()).ToList(), [mid]);
+                break;
+            case "svc" when type is not null:
+                // servizio WCF ospitato da IIS: una rotta per operazione, con l'URL del file .svc
+                _hostedServices.Add(Id(type)!);
+                foreach (var (op, impl) in WcfOperations(type))
+                    if (Id(impl.Norm()) is { } oid)
+                        Route("wcf", ["WCF"], $"{pf.ProjRel}/{op}", stem, op, auth.Concat(impl.Authorization()).ToList(), [oid]);
                 break;
             case "asax":
                 // eventi dell'applicazione, che girano per ogni richiesta (autenticazione, errori, sessione).

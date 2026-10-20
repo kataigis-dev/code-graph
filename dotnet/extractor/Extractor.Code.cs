@@ -111,15 +111,25 @@ public sealed partial class Extractor
         }
         if (name is "SaveChanges" or "SaveChangesAsync") n["saves_changes"] = true;
 
+        // ConfigurationManager.AppSettings.Get("chiave")
+        if (name == "Get" && inv.Expression is MemberAccessExpressionSyntax { Expression: var settings }
+            && settings.ToString().EndsWith("AppSettings", StringComparison.Ordinal) && inv.LiteralArg(0) is { } key)
+            ConfigKey(w, n, key, line);
+
         if (target is null) n.AddDistinct("unresolved_calls", Text.Truncate(inv.Expression.ToString(), 120), 50);
-        else if (InSource(target.Norm())) Link(w.Id, Id(target.Norm()), "CALLS", line);
-        else RecordExternal(n, target.Norm());
+        else
+        {
+            OnDispatchInvocation(w, n, inv, target);
+            if (InSource(target.Norm())) Link(w.Id, Id(target.Norm()), "CALLS", line);
+            else RecordExternal(n, target.Norm());
+        }
     }
 
     private void OnCreation(BodyWork w, GraphNode n, BaseObjectCreationExpressionSyntax oc)
     {
         if (w.Model.SymbolOf(oc) is not IMethodSymbol ctor) return;
         var c = ctor.Norm();
+        OnTimerCreation(w, oc, c);
         if (!InSource(c)) { RecordExternal(n, c); return; }
         Link(w.Id, Id(c), "CALLS", oc.Line());
         Link(w.Id, Id(c.ContainingType.OriginalDefinition), "INSTANTIATES", oc.Line());
@@ -188,7 +198,7 @@ public sealed partial class Extractor
         if (asg.IsKind(SyntaxKind.AddAssignmentExpression) && w.Model.GetSymbolInfo(asg.Left).Symbol is IEventSymbol ev)
         {
             if (w.Model.HandlerOf(asg.Right) is { } h && InSource(h) && Id(h.Norm()) is { } hid
-                && Id(w.Symbol.ContainingType.OriginalDefinition) is { } owner)
+                && !OnEventSubscription(w, ev, hid, asg.Line()) && Id(w.Symbol.ContainingType.OriginalDefinition) is { } owner)
             {
                 var control = asg.Left is MemberAccessExpressionSyntax evm ? evm.Expression.ToString() : "this";
                 _pendingEvents.Add(new PendingEvent(owner, control, ev.Name, hid));
@@ -223,19 +233,25 @@ public sealed partial class Extractor
         n.AddItem("throws", new() { ["type"] = type, ["message"] = message, ["line"] = oc.Line() }, 30);
     }
 
-    private static void OnElementAccess(BodyWork w, GraphNode n, ElementAccessExpressionSyntax ea)
+    private void OnElementAccess(BodyWork w, GraphNode n, ElementAccessExpressionSyntax ea)
     {
         if (ea.ArgumentList.Arguments.FirstOrDefault()?.Expression is not LiteralExpressionSyntax { Token.ValueText: var key }) return;
         var last = ea.Expression.ToString().Split('.').Last();
         switch (last)
         {
-            case "AppSettings": n.AddDistinct("config_keys", key); break;
+            case "AppSettings": ConfigKey(w, n, key, ea.Line()); break;
             case "ConnectionStrings": n.AddDistinct("connection_strings", key); break;
             case "Session" or "TempData" or "ViewData" or "ViewState" or "Application" or "Cache"
                  or "Form" or "QueryString" or "Request" or "Params" when w.Model.SymbolOf(ea.Expression).IsWebState():
                 n.AddDistinct(last is "Form" or "QueryString" or "Request" or "Params" ? "request_keys" : "state_keys", $"{last}[{key}]");
                 break;
         }
+    }
+
+    private void ConfigKey(BodyWork w, GraphNode n, string key, int line)
+    {
+        n.AddDistinct("config_keys", key);
+        _pendingConfig.Add((w.Id, key, line));
     }
 
     private static void OnMemberAccess(GraphNode n, MemberAccessExpressionSyntax ma)

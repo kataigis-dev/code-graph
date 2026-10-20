@@ -20,12 +20,20 @@ CALL_EDGES = ("CALLS", "DISPATCHES_TO")
 DATA_EDGES = ("READS", "WRITES", "CALLS_PROC")
 # flusso di esecuzione: chiamate piu' i collegamenti Web Forms (pagina -> gestori di evento, controlli utente, master page)
 FLOW_EDGES = CALL_EDGES + ("HANDLES_EVENT", "USES_CONTROL", "USES_MASTER")
+DB_LOGIC_KINDS = ("StoredProcedure", "Trigger")
+# entry point raggiungibili dalla rete: per gli altri (batch, job, servizi, messaggi, eventi) l'autorizzazione non si applica
+NETWORK_FLAVORS = {"mvc", "webapi", "aspnetcore", "convention", "webforms", "asmx", "ashx", "httphandler", "wcf", "signalr"}
+# integrazioni che in un test vanno sostituite (server SMTP di prova, stub HTTP, code locali)
+SIDE_EFFECTS = {"email", "http", "wcf", "msmq", "rabbitmq", "servicebus", "azure-messaging", "filesystem", "ldap", "cache"}
+VALIDATION_ATTRS = re.compile(
+    r"^(Required|StringLength|MaxLength|MinLength|Range|RegularExpression|EmailAddress|Phone|Compare|CreditCard|Url|Remote)\b")
 
 # proprieta' dei metodi che raccontano "cose interessanti" per il reverse engineering
 FACT_KEYS = (
     "integrations", "external_calls", "state_usage", "state_keys", "viewbag_keys", "config_keys",
     "connection_strings", "request_keys", "validations", "throws", "sql_snippets", "saves_changes",
     "returns_json", "uses_system_web", "unresolved_calls", "unresolved_redirects", "unresolved_links", "unresolved_handlers",
+    "messages_sent", "dynamic_sql",
 )
 BRIEF_KEYS = ("file", "startLine", "loc", "complexity", "verbs", "template", "model", "unresolved")
 ROUTE_KEYS = ("id", "name", "flavor", "verbs", "template", "friendly_urls", "controller", "action", "area", "authorization", "filters")
@@ -103,6 +111,8 @@ class CodeGraph:
         # riassunti di enrich.py: l'ultima versione di ogni nodo vince
         self.summaries: dict[str, dict] = (
             {r["id"]: r for r in _load_jsonl(summaries_path)} if summaries_path and os.path.exists(summaries_path) else {})
+        self._seams: dict[str, dict] = {}
+        self._by_fqn: dict[str, str] | None = None
 
     # ------------------------------------------------------------------ primitive
 
@@ -159,8 +169,10 @@ class CodeGraph:
 
     def trace(self, nid: str, max_depth: int = 8, max_nodes: int = 300) -> dict[str, Any]:
         """
-        Dossier as-is di una rotta (o di un metodo): metodi raggiunti, tabelle lette e scritte, viste, redirect,
-        integrazioni, stato implicito, validazioni, eccezioni. E' il contesto di partenza per la specifica di un caso d'uso.
+        Dossier as-is di una rotta (o di un metodo): metodi raggiunti, logica nel database (stored procedure chiamate e
+        trigger delle tabelle scritte), tabelle lette e scritte con i loro vincoli, viste, redirect, integrazioni, stato
+        implicito, configurazione, validazioni (anche dei DTO), eccezioni, messaggi e job, punto di aggancio per i test.
+        E' il contesto di partenza per la specifica di un caso d'uso.
         """
         a = self.attrs(nid)
         if a.get("kind") == "Route":
@@ -170,15 +182,21 @@ class CodeGraph:
             handlers, entry = [nid], self.brief(nid)
         reached, truncated = self._reach(handlers, max_depth, max_nodes)
 
-        methods, tables, procs, views, redirects, integrations = [], {}, {}, {}, set(), {}
-        facts: dict[str, list] = {k: [] for k in ("state", "config_keys", "validations", "throws", "request_keys")}
+        methods, db_logic, tables, procs, views, redirects, integrations = [], [], {}, {}, {}, set(), {}
+        facts: dict[str, list] = {k: [] for k in ("state", "config_keys", "validations", "throws", "request_keys",
+                                                  "constraints", "messages", "schedules")}
         for m, depth, via in reached:
             ma = self.attrs(m)
-            if ma.get("kind") == "Page":
+            kind = ma.get("kind")
+            if kind == "Page":
                 views[m] = self.view_info(m)
-            elif ma.get("kind") == "Method":
+            elif kind == "Method":
                 flags = [k for k in TRACE_FLAGS if ma.get(k)]
                 methods.append(self.brief(m) | {"depth": depth, "via": via} | ({"flags": flags} if flags else {}))
+            elif kind in DB_LOGIC_KINDS:
+                db_logic.append({"id": m, "kind": kind, "dbObject": ma.get("dbObject"), "depth": depth, "via": via,
+                                 "file": ma.get("file"), "startLine": ma.get("startLine"), "inSchema": bool(ma.get("inSchema")),
+                                 "dynamic_sql": bool(ma.get("dynamic_sql"))})
             else:
                 continue
             for t, d in self.out(m, DATA_EDGES):
@@ -193,15 +211,32 @@ class CodeGraph:
                 integrations.setdefault(cat, []).append(m)
             state = ma.get("state_usage", []) + ma.get("state_keys", []) + [f"ViewBag.{x}" for x in ma.get("viewbag_keys", [])]
             facts["state"] += [{"method": m, "item": k} for k in state]
-            facts["config_keys"] += [{"method": m, "key": k} for k in ma.get("config_keys", [])]
+            facts["config_keys"] += [{"method": m, "key": k, "values": self.config_values(k)} for k in ma.get("config_keys", [])]
             facts["request_keys"] += [{"method": m, "key": k} for k in ma.get("request_keys", [])]
             facts["validations"] += [{"method": m, **v} for v in ma.get("validations", [])]
             facts["throws"] += [{"method": m, **t} for t in ma.get("throws", [])]
+            facts["messages"] += [{"method": m, "route": r, "line": d.get("line")} for r, d in self.out(m, ["SENDS_MESSAGE"])]
+            facts["schedules"] += [{"method": m, "route": r, "line": d.get("line")} for r, d in self.out(m, ["SCHEDULES"])]
+        for h in handlers:
+            facts["validations"] += self.input_validations(h)
+        for tid, item in tables.items():
+            if item["writes"]:
+                facts["constraints"] += [{"table": tid, **c} for c in self.attrs(tid).get("constraints", [])
+                                         if c.get("kind") in ("CHECK", "UNIQUE", "FOREIGN KEY")]
         for item in [*tables.values(), *procs.values()]:
             item["via"] = sorted(item["via"])
-        return {"entry": entry, "handlers": handlers, "methods": methods, "tables": tables, "stored_procedures": procs,
-                "views": list(views.values()), "redirects": sorted(redirects), "integrations": integrations, **facts,
+        return {"entry": entry, "handlers": handlers, "methods": methods, "db_logic": db_logic, "tables": tables,
+                "stored_procedures": procs, "views": list(views.values()), "redirects": sorted(redirects),
+                "integrations": integrations, **facts, "seam": self.route_seam(handlers, [x["id"] for x in methods]),
                 "truncated": truncated, "note": HEURISTIC_NOTE}
+
+    def _next(self, node: str) -> Iterable[tuple[str, str]]:
+        """Passi del flusso: chiamate, gestori, stored procedure chiamate e trigger delle tabelle che il nodo scrive."""
+        for v, d in self.out(node, FLOW_EDGES + ("CALLS_PROC",)):
+            yield v, d["type"]
+        for t, _ in self.out(node, ["WRITES"]):
+            for trg, _ in self.out(t, ["TRIGGERS"]):
+                yield trg, "TRIGGERS"
 
     def _reach(self, start: list[str], max_depth: int, max_nodes: int) -> tuple[list[tuple[str, int, str]], bool]:
         """Visita in ampiezza lungo il flusso di esecuzione: (nodo, profondita', arco di arrivo) e se e' stata troncata."""
@@ -211,12 +246,86 @@ class CodeGraph:
             node, depth = queue.popleft()
             if depth >= max_depth:
                 continue
-            for nxt, d in self.out(node, FLOW_EDGES):
+            for nxt, etype in self._next(node):
                 if nxt not in seen:
                     seen.add(nxt)
-                    order.append((nxt, depth + 1, d["type"]))
+                    order.append((nxt, depth + 1, etype))
                     queue.append((nxt, depth + 1))
         return [(s, 0, "entry") for s in start] + order, bool(queue) or len(order) >= max_nodes
+
+    # ------------------------------------------------------------------ fatti di supporto al dossier
+
+    def config_values(self, key: str) -> list[dict]:
+        """Valori della chiave nei file di configurazione del repository (vuoto se mancano: vanno chiesti)."""
+        cid = "CFG:" + key
+        return list(self.attrs(cid).get("values") or []) if cid in self.g else []
+
+    def type_by_fqn(self, fqn: str) -> str | None:
+        if self._by_fqn is None:
+            self._by_fqn = {a["fqn"]: n for n, a in self.g.nodes(data=True) if a.get("kind") == "Type" and a.get("fqn")}
+        return self._by_fqn.get(fqn)
+
+    def input_validations(self, handler: str, depth: int = 2) -> list[dict]:
+        """
+        Attributi di validazione ([Required], [Range], ...) dei tipi dei parametri dell'handler e delle loro proprieta':
+        il model binding di MVC e Web API li applica prima dell'action, quindi fanno parte del caso d'uso.
+        """
+        if self.attrs(handler).get("kind") != "Method":
+            return []
+        found, seen = [], set()
+
+        def visit(fqn: str, level: int, path: str) -> None:
+            tid = self.type_by_fqn(re.sub(r"^(?:System\.Collections\.Generic\.)?I?(?:List|Enumerable|Collection)<(.+)>$", r"\1", fqn))
+            if tid is None or tid in seen or level > depth:
+                return
+            seen.add(tid)
+            for p in self.attrs(tid).get("properties") or []:
+                for attr in p.get("attributes") or []:
+                    if VALIDATION_ATTRS.match(attr):
+                        found.append({"method": tid, "field": path + p["name"], "type": "DataAnnotations", "rule": attr,
+                                      "line": p.get("line"), "file": p.get("file")})
+                visit(str(p.get("type") or ""), level + 1, f"{path}{p['name']}.")
+
+        for param in self.attrs(handler).get("parameters") or []:
+            visit(str(param).rsplit(" ", 1)[0], 0, "")
+        return found
+
+    def test_seam(self, nid: str) -> dict[str, Any]:
+        """
+        Si puo' testare il metodo in processo? No se cio' che raggiunge usa stato implicito (Session, ViewState,
+        HttpContext.Current, ...) o passa da pagine Web Forms: servono una richiesta HTTP o la UI.
+        needs: cio' che il test deve fornire (database, chiavi di configurazione, sostituti delle integrazioni).
+        """
+        if nid not in self._seams:
+            reached, _ = self._reach([nid], 12, 400)
+            blockers, needs = [], set()
+            for m, _, _ in reached:
+                a = self.attrs(m)
+                if a.get("kind") == "Page":
+                    blockers.append({"node": m, "reason": "pagina Web Forms"})
+                elif a.get("state_usage"):
+                    blockers.append({"node": m, "reason": ", ".join(a["state_usage"])})
+                if self.out(m, DATA_EDGES):
+                    needs.add("database")
+                needs.update(f"configurazione {k}" for k in a.get("config_keys") or [])
+                needs.update(c for c in a.get("integrations") or [] if c in SIDE_EFFECTS)
+            self._seams[nid] = {"in_process": not blockers, "blockers": blockers[:5], "needs": sorted(needs)}
+        return self._seams[nid]
+
+    def route_seam(self, handlers: list[str], methods: list[str]) -> dict[str, Any]:
+        """Aggancio per i test della rotta: l'handler e, se non e' testabile in processo, i metodi piu' vicini che lo sono."""
+        result: dict[str, Any] = {"handlers": [{"node": h, **self.test_seam(h)} for h in handlers if h in self.g]}
+        if all(x["in_process"] for x in result["handlers"]):
+            return result
+        candidates = []
+        for m in methods:
+            a = self.attrs(m)
+            interesting = (a.get("validations") or a.get("throws") or self.out(m, ["WRITES", "CALLS_PROC"])
+                           or a.get("config_keys") or int(a.get("complexity") or 1) > 1)
+            if m not in handlers and interesting and self.test_seam(m)["in_process"]:
+                candidates.append({"node": m, **self.test_seam(m)})
+        result["candidates"] = candidates[:5]
+        return result
 
     def view_info(self, v: str, partial: bool = False) -> dict[str, Any]:
         """Vista Razor o pagina Web Forms in un dossier: modello o code-behind, campi, controlli, form e link."""

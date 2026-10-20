@@ -1,0 +1,1 @@
+<%@ ServiceHost Language="C#" Debug="false" Service="Shop.Legacy.Services.OrderWcfService" CodeBehind="OrderService.svc.cs" %>

@@ -13,8 +13,9 @@ namespace System.Data.Entity
         Collections.IEnumerator Collections.IEnumerable.GetEnumerator() => throw new NotSupportedException();
     }
 
-    public class DbContext
+    public class DbContext : IDisposable
     {
+        public void Dispose() { }
         public DbSet<T> Set<T>() where T : class => null;
         public DbEntityEntry<T> Entry<T>(T entity) where T : class => null;
         public int SaveChanges() => 0;
@@ -27,8 +28,10 @@ namespace System.Data.SqlClient
     public class SqlCommand : IDisposable
     {
         public SqlCommand(string text) { }
+        public Data.CommandType CommandType { get; set; }
         public SqlParameterCollection Parameters => null;
         public object ExecuteScalar() => null;
+        public int ExecuteNonQuery() => 0;
         public void Dispose() { }
     }
 }

@@ -62,6 +62,9 @@ internal static class SymbolExtensions
             var name = a.AttrName();
             var origin = inheritedFrom is null ? "" : $" [ereditato da {inheritedFrom}]";
             if (name == "AllowAnonymous") result.Add(name + origin);
+            // WCF e codice .NET Framework: [PrincipalPermission(SecurityAction.Demand, Role = "Admin")]
+            else if (name == "PrincipalPermission")
+                result.Add($"{name}({string.Join(", ", a.NamedArguments.Select(kv => $"{kv.Key}={kv.Value.Value}"))})" + origin);
             else if (name.EndsWith("Authorize", StringComparison.Ordinal))
             {
                 var args = a.NamedArguments.Select(kv => $"{kv.Key}={kv.Value.Value}").ToList();

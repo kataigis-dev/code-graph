@@ -1,6 +1,6 @@
 """
-Documentazione Markdown generata dal grafo: la usano un agente (Claude Code o altri) con i normali strumenti
-su file, cioe' lettura e ricerca testuale, e le persone in un editor o su un sito Markdown.
+Documentazione Markdown generata dal grafo: la usano un agente (Claude Code, GitHub Copilot o altri) con i normali
+strumenti su file, cioe' lettura e ricerca testuale, e le persone in un editor o su un sito Markdown.
 
     python graph_docs.py --graph graph.json --summaries summaries.jsonl --out C:\\src\\MiaApp\\docs\\graph
 
@@ -8,17 +8,19 @@ Pensata per progetti grandi: tanti file piccoli, un indice per livello e gli id 
 sempre scritti per esteso, cosi' una ricerca testuale su un id trova ogni punto in cui il nodo compare.
 
     INDEX.md                      punto di partenza: numeri, progetti, entry point, dati, report
-    routes/INDEX.md               gruppi di entry point (controller, cartelle Web Forms, servizi)
+    routes/INDEX.md               gruppi di entry point (controller, cartelle Web Forms, servizi, batch, job, messaggi)
     routes/<gruppo>.md            rotte del gruppo
     routes/<gruppo>/<rotta>.md    dossier di una rotta: il contesto di partenza per un caso d'uso
     types/INDEX.md                progetti
     types/<progetto>/INDEX.md     namespace e tipi del progetto
     types/<progetto>/<tipo>.md    metodi del tipo (le classi con molti metodi continuano in <tipo>.2.md, ...)
-    tables/INDEX.md               tabelle e stored procedure
-    tables/<tabella>.md           chi legge, chi scrive, da quali rotte
+    tables/INDEX.md               tabelle, viste, stored procedure, funzioni e trigger
+    tables/<tabella>.md           colonne e vincoli dallo schema SQL, chi legge, chi scrive, da quali rotte
+    tables/sp-<nome>.md, fn-, tr- stored procedure, funzioni e trigger: parametri, cosa leggono e scrivono, eccezioni
     views/INDEX.md                viste Razor e file Web Forms per progetto
     views/<progetto>.md           dettaglio di viste, pagine, controlli, master page
-    reports/*.md                  autorizzazioni, proprieta' dei dati, stato implicito, integrazioni, complessita', lacune
+    reports/*.md                  autorizzazioni, proprieta' dei dati, domini candidati, database, configurazione,
+                                  stato implicito, integrazioni, complessita', lacune
 
 La cartella di uscita viene rigenerata a ogni esecuzione: si cancellano solo INDEX.md e le sottocartelle elencate
 sopra, e solo se la cartella e' vuota o e' gia' stata generata da questo script (file .graph-docs).
@@ -35,7 +37,7 @@ from collections import defaultdict
 from typing import Any, Callable, Iterable
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from codegraph import CALL_EDGES, DATA_EDGES, CodeGraph  # noqa: E402
+from codegraph import CALL_EDGES, DATA_EDGES, NETWORK_FLAVORS, CodeGraph  # noqa: E402
 
 MARKER = ".graph-docs"
 SECTIONS = ("routes", "types", "tables", "views", "reports")
@@ -49,15 +51,24 @@ FACT_LABELS = (
     ("state_keys", "Chiavi di stato"), ("viewbag_keys", "ViewBag"), ("config_keys", "Chiavi di configurazione"),
     ("connection_strings", "Connection string"), ("request_keys", "Parametri della richiesta"),
     ("sql_snippets", "SQL"), ("unresolved_calls", "Chiamate non risolte"), ("unresolved_redirects", "Redirect non risolti"),
+    ("messages_sent", "Messaggi inviati"),
 )
 FLAG_LABELS = (("saves_changes", "chiama SaveChanges"), ("returns_json", "restituisce JSON"),
-               ("uses_system_web", "dipende da System.Web"))
+               ("uses_system_web", "dipende da System.Web"),
+               ("dynamic_sql", "SQL dinamico (EXEC di una stringa: tabelle e procedure non determinabili)"))
 PAGE_KINDS = {"aspx": "pagina Web Forms", "ascx": "controllo utente", "master": "master page",
-              "asmx": "servizio web (asmx)", "ashx": "handler (ashx)", "asax": "Global.asax"}
+              "asmx": "servizio web (asmx)", "ashx": "handler (ashx)", "asax": "Global.asax", "svc": "servizio WCF (svc)"}
 VIEW_LINKS = (("USES_MASTER", "Master page"), ("USES_LAYOUT", "Layout"), ("USES_CONTROL", "Controlli utente"),
               ("RENDERS_PARTIAL", "Partial"))
 TRACE_FLAGS = {"state_usage": "stato implicito", "uses_system_web": "System.Web", "saves_changes": "SaveChanges",
                "returns_json": "JSON", "abstract": "astratto"}
+# gruppi degli entry point che non sono action o pagine
+FLAVOR_GROUPS = {"wcf": "wcf", "service": "servizio Windows", "batch": "batch", "desktop": "desktop", "job": "job",
+                 "timer": "timer", "message": "messaggi", "httpmodule": "modulo HTTP", "httphandler": "handler HTTP",
+                 "signalr": "hub", "owin": "owin"}
+DB_LABELS = {"table": "Tabella", "view": "Vista", "procedure": "Stored procedure", "function": "Funzione", "trigger": "Trigger"}
+ROUTE_DETAILS = (("schedule", "pianificazione"), ("scheduler", "scheduler"), ("message", "messaggio"),
+                 ("events", "eventi dell'applicazione"), ("registeredIn", "registrato in"), ("unresolved", "attenzione"))
 UNRESOLVED = (("unresolved_calls", "Chiamate non risolte (reflection, dynamic, riferimenti mancanti)"),
               ("unresolved_redirects", "Redirect non risolti"), ("unresolved_links", "Link non risolti"),
               ("unresolved_handlers", "Gestori di evento non trovati"), ("unresolved_code_behind", "Code-behind non trovato"))
@@ -123,6 +134,8 @@ def route_group(a: dict) -> str:
         return f"pagine {ctrl}"
     if flavor in ("asmx", "ashx"):
         return f"{flavor} {ctrl}"
+    if flavor in FLAVOR_GROUPS:
+        return f"{FLAVOR_GROUPS[flavor]} {ctrl}"
     if flavor == "global":
         return "Global.asax"
     return f"{a['area']} {ctrl}" if a.get("area") else ctrl
@@ -154,6 +167,7 @@ class Docs:
         # dei dossier si tiene solo il necessario ai report: tenerli interi su un grafo grande costa gigabyte
         self.route_tables: dict[str, dict[str, tuple[bool, bool]]] = {}  # rotta -> tabella -> (legge, scrive)
         self.reached_by: dict[str, set[str]] = defaultdict(set)          # nodo -> rotte il cui dossier lo raggiunge
+        self.route_inputs: dict[str, dict[str, set[str]]] = {}           # rotta che scrive -> campo in ingresso -> dove
         self._names: dict[str, set[str]] = {}
         self.files = 0
 
@@ -213,7 +227,7 @@ class Docs:
 
     def plan(self) -> None:
         cg, groups = self.cg, defaultdict(list)
-        for nid, a in self.nodes("Type", "Project", "Table", "StoredProcedure", "Route"):
+        for nid, a in self.nodes("Type", "Project", "Table", "StoredProcedure", "Trigger", "Route", "Config"):
             kind = a.get("kind")
             if kind == "Type":
                 self.loc[nid] = self.new_file(f"types/{slug(a.get('project') or '_')}", a.get("fqn") or nid[2:])
@@ -221,8 +235,11 @@ class Docs:
                 self.loc[nid] = f"types/{slug(a.get('name') or nid)}/INDEX.md"
             elif kind == "Route":
                 groups[route_group(a)].append(nid)
+            elif kind == "Config":
+                self.loc[nid] = f"reports/configuration.md#{anchor(nid)}"
             else:
-                self.loc[nid] = self.new_file("tables", ("sp-" if kind == "StoredProcedure" else "") + str(a.get("name") or nid))
+                prefix = {"Trigger": "tr-", "StoredProcedure": "fn-" if a.get("dbObject") == "function" else "sp-"}.get(kind, "")
+                self.loc[nid] = self.new_file("tables", prefix + str(a.get("name") or nid))
         self.groups = {g: sorted(groups[g]) for g in sorted(groups)}
         for group, routes in self.groups.items():
             path = self.group_file[group] = self.new_file("routes", group)
@@ -290,6 +307,50 @@ class Docs:
             f"  - regola: {cell(r.get('rule', ''))} ({r.get('confidence', '?')}, righe {r.get('lines', '?')})"
             for r in (s.get("business_rules") or [])[:10] if isinstance(r, dict)]
 
+    def db_label(self, a: dict) -> str:
+        if a.get("kind") == "Trigger":
+            return "Trigger"
+        if a.get("dbObject") in DB_LABELS:
+            return DB_LABELS[a["dbObject"]]
+        return "Stored procedure" if a.get("kind") == "StoredProcedure" else "Tabella"
+
+    def config_text(self, values: list[dict], f: str) -> str:
+        if not values:
+            return "nessun valore nei file di configurazione del repository: chiedilo"
+        return "; ".join(f"{code(v.get('value'))} ({self.src(v, f, v.get('line'))}"
+                         + (f", ambiente {v['environment']}" if v.get("environment") else "") + ")" for v in values)
+
+    def seam_lines(self, seam: dict, f: str) -> list[str]:
+        """Dove agganciare i test del caso d'uso: l'handler se e' testabile in processo, altrimenti i metodi che lo sono."""
+        def needs(s: dict) -> str:
+            return f"; serve: {', '.join(s['needs'])}" if s.get("needs") else ""
+        lines = []
+        for h in seam.get("handlers") or []:
+            if h["in_process"]:
+                lines.append(f"- {self.link(h['node'], f)}: testabile in processo{needs(h)}")
+            else:
+                why = ", ".join(f"{b['reason']} in {self.link(b['node'], f)}" for b in h["blockers"])
+                lines.append(f"- {self.link(h['node'], f)}: non in processo ({why}): test via HTTP o UI{needs(h)}")
+        for c in seam.get("candidates") or []:
+            lines.append(f"  - in alternativa, in processo: {self.ref(c['node'], f)}{needs(c)}")
+        return lines
+
+    def input_fields(self, t: dict) -> dict[str, set[str]]:
+        """Campi in ingresso di un caso d'uso per nome: campi delle viste e delle pagine, parametri della richiesta, proprieta' dei DTO."""
+        cg, fields = self.cg, defaultdict(set)
+        for v in t["views"]:
+            for bf in v.get("bound_fields") or []:
+                name = str(bf).split(" (")[0].split(".")[-1]
+                fields[name.lower()].add(f"{cg.attrs(v['id']).get('name') or v['id']} ({bf})")
+        for x in t["request_keys"]:
+            fields[x["key"].split("[")[-1].rstrip("]").lower()].add(x["key"])
+        for h in t["handlers"]:
+            for param in cg.attrs(h).get("parameters") or [] if h in cg.g else []:
+                tid = cg.type_by_fqn(str(param).rsplit(" ", 1)[0])
+                for prop in (cg.attrs(tid).get("properties") or []) if tid else []:
+                    fields[prop["name"].lower()].add(f"{cg.attrs(tid).get('name')}.{prop['name']}")
+        return fields
+
     def reached_line(self, nid: str, f: str, cap: int = 15) -> list[str]:
         routes = sorted(self.reached_by.get(nid, ()))
         return [f"- Raggiunto dalle rotte ({len(routes)}): " + joined(routes, lambda r: self.link(r, f, r[2:]), cap)] if routes else []
@@ -303,7 +364,10 @@ class Docs:
             for rid in routes:
                 t = cg.trace(rid, ROUTE_DEPTH, ROUTE_NODES)
                 self.route_tables[rid] = {tid: (bool(v["reads"]), bool(v["writes"])) for tid, v in t["tables"].items()}
-                for nid in [m["id"] for m in t["methods"]] + [*t["tables"], *t["stored_procedures"]] + [v["id"] for v in t["views"]]:
+                if any(w for _, w in self.route_tables[rid].values()):
+                    self.route_inputs[rid] = self.input_fields(t)
+                for nid in ([m["id"] for m in t["methods"]] + [*t["tables"], *t["stored_procedures"]]
+                            + [x["id"] for x in t["db_logic"]] + [v["id"] for v in t["views"]]):
                     self.reached_by[nid].add(rid)
                 f = self.loc[rid]
                 header = self.page(f, label(rid[2:]), (f"Gruppo {group}", gf), ("Entry point", "routes/INDEX.md"))
@@ -321,7 +385,9 @@ class Docs:
 
         f = "routes/INDEX.md"
         lines = self.page(f, "Entry point")
-        lines += ["Ogni gruppo raccoglie le rotte di un controller, di una cartella Web Forms o di un servizio.", ""]
+        lines += ["Ogni gruppo raccoglie le rotte di un controller, di una cartella Web Forms o di un servizio, oppure gli entry "
+                  "point che non passano dal browser: servizi WCF e Windows, batch, job, timer, handler di messaggi, "
+                  "moduli e handler HTTP, hub SignalR, OWIN.", ""]
         lines += table("Gruppo", "Rotte", "Senza autorizzazione dichiarata")
         for g, rs in self.groups.items():
             open_ = sum(1 for r in rs if not cg.attrs(r).get("authorization"))
@@ -335,8 +401,15 @@ class Docs:
                  f"- Tipo: {a.get('flavor') or '?'} · verbi {', '.join(a.get('verbs') or [])} · template {code(a.get('template'))}"]
         if a.get("friendly_urls"):
             lines.append("- URL alternativi (MapPageRoute): " + ", ".join(code(u) for u in a["friendly_urls"]))
-        lines.append("- Autorizzazione: " + ("; ".join(code(x) for x in auth) if auth
-                                              else "nessuna dichiarata (verifica filtri globali, web.config e controlli nel codice)"))
+        details = [f"{title} {code(joined(a[k]) if isinstance(a[k], list) else a[k])}" for k, title in ROUTE_DETAILS if a.get(k)]
+        if details:
+            lines.append("- Dettagli: " + " · ".join(details))
+        if auth:
+            lines.append("- Autorizzazione: " + "; ".join(code(x) for x in auth))
+        elif a.get("flavor") in NETWORK_FLAVORS:
+            lines.append("- Autorizzazione: nessuna dichiarata (verifica filtri globali, moduli HTTP, web.config e controlli nel codice)")
+        else:
+            lines.append("- Autorizzazione: non applicabile, l'entry point non e' raggiungibile da un utente via rete")
         if a.get("filters"):
             lines.append("- Filtri: " + ", ".join(code(x) for x in a["filters"]))
         lines.append("- Handler: " + ", ".join(self.ref(h, f) for h in t["handlers"]))
@@ -363,6 +436,15 @@ class Docs:
             callers = ", ".join(self.link(x, f) for x in v["calls"][:4])
             rows.append(f"| {self.ref(pid, f)} (stored procedure) | | | {', '.join(v['via'])} | {callers} |")
         lines += section("Dati", table("Tabella", "Lettura", "Scrittura", "Via", "Da") + rows if rows else [])
+        db_rows = [f"- {self.ref(x['id'], f)}: {self.db_label(cg.attrs(x['id'])).lower()}, "
+                   + ("raggiunto via chiamata" if x["via"] == "CALLS_PROC" else "scatta sulle scritture di una tabella")
+                   + f", {self.src(cg.attrs(x['id']), f)}" + (" · SQL dinamico" if x["dynamic_sql"] else "")
+                   + ("" if x["inSchema"] else " · non trovato nello schema SQL") for x in t["db_logic"]]
+        lines += section("Logica nel database", db_rows)
+        lines += section("Vincoli del database sulle tabelle scritte", [
+            f"- {self.link(c['table'], f)}: {c['kind']} " + code(c.get("expression") or ", ".join(c.get("columns") or []))
+            + (f" verso {code(c['references'])}" if c.get("references") else "") + (f" dove {code(c['filter'])}" if c.get("filter") else "")
+            + f", {self.src({'file': c.get('file')}, f, c.get('line'))}" for c in t["constraints"]])
 
         rows = []
         for v in t["views"]:
@@ -383,13 +465,18 @@ class Docs:
         # "ViewState" e' superfluo se lo stesso metodo ha gia' una chiave ViewState[...]
         keyed = {(x["method"], x["item"].split("[")[0]) for x in t["state"] if "[" in x["item"]}
         state = [("stato", x["item"], x["method"]) for x in t["state"] if "[" in x["item"] or (x["method"], x["item"]) not in keyed]
-        state += [("config", x["key"], x["method"]) for x in t["config_keys"]]
         state += [("richiesta", x["key"], x["method"]) for x in t["request_keys"]]
+        config = [f"- config: {code(x['key'])} = {self.config_text(x['values'], f)} in {self.link(x['method'], f)}"
+                  for x in t["config_keys"]]
         lines += section("Stato implicito, configurazione, parametri",
-                         [f"- {kind}: {code(item)} in {self.link(m, f)}" for kind, item, m in state])
+                         [f"- {kind}: {code(item)} in {self.link(m, f)}" for kind, item, m in state] + config)
         lines += section("Validazioni", [f"- {validation_text(v)} in {self.link(v['method'], f)}" for v in t["validations"]])
-        lines += section("Eccezioni", [f"- {code(x.get('type'))} {cell(x.get('message') or '')} in {self.link(x['method'], f)}"
-                                       for x in t["throws"]])
+        lines += section("Eccezioni", [f"- {code(x.get('type'))} {cell(x.get('message') or '')}"
+                                       + (f" se {code(x['condition'])}" if x.get("condition") else "")
+                                       + f" in {self.link(x['method'], f)}, riga {x.get('line')}" for x in t["throws"]])
+        lines += section("Messaggi e job", [f"- {self.link(x['method'], f)} invia a {self.ref(x['route'], f)}" for x in t["messages"]]
+                         + [f"- {self.link(x['method'], f)} pianifica {self.ref(x['route'], f)}" for x in t["schedules"]])
+        lines += section("Aggancio per i test", self.seam_lines(t["seam"], f))
         if t["truncated"]:
             lines += [f"> Dossier troncato (profondita' {ROUTE_DEPTH}, {ROUTE_NODES} nodi): "
                       "segui i metodi piu' profondi dalle loro schede.", ""]
@@ -473,6 +560,13 @@ class Docs:
         nested = [v for v, _ in cg.out(tid, ["CONTAINS"]) if cg.attrs(v).get("kind") == "Type"]
         if nested:
             lines.append("- Tipi annidati: " + ", ".join(self.link(v, f) for v in nested))
+        props = a.get("properties") or []
+        if props:
+            lines += ["", f"## Proprieta' ({len(props)})", ""] + table("Proprieta'", "Tipo", "Attributi", "Riga") + [
+                f"| {code(x['name'])} | {code(x.get('type'))} | {cell(', '.join(x.get('attributes') or [])) or '-'} "
+                f"| {self.src(x, f, x.get('line')) if x.get('file') else x.get('line') or '-'} |" for x in props[:80]]
+            if len(props) > 80:
+                lines.append(f"| {more(props, 80)} | | | |")
         lines += ["", f"## Metodi ({len(methods)})", ""]
         if len(chunks) > 1:
             lines += [f"Classe grande: i metodi sono divisi in {len(chunks)} file da {METHODS_PER_FILE}: "
@@ -512,7 +606,8 @@ class Docs:
             lines.append("- Entry point: " + ", ".join(entry))
         lines += self.reached_line(mid, f) + self.summary_lines(mid) + self.fact_lines(a) + self.data_lines(mid, f)
         for title, types in (("Viste", ["RENDERS"]), ("Redirect verso", ["REDIRECTS_TO"]), ("Chiama", ["CALLS"]),
-                             ("Dispatch verso le implementazioni", ["DISPATCHES_TO"])):
+                             ("Dispatch verso le implementazioni", ["DISPATCHES_TO"]), ("Pianifica", ["SCHEDULES"]),
+                             ("Invia messaggi a", ["SENDS_MESSAGE"]), ("Configurazione", ["USES_CONFIG"])):
             lines += self.edge_list(mid, f, title, types)
         return lines + self.edge_list(mid, f, "Chiamato da", CALL_EDGES, out=False, cap=30) + [""]
 
@@ -520,40 +615,112 @@ class Docs:
 
     def write_tables(self) -> None:
         cg, f = self.cg, "tables/INDEX.md"
-        tables = self.nodes("Table", "StoredProcedure")
-        lines = self.page(f, "Tabelle e stored procedure") + [
-            "Letture e scritture dirette dei metodi e delle pagine; le rotte sono quelle il cui dossier arriva alla tabella.", ""]
-        lines += table("Nome", "Tipo", "Origine", "Letture", "Scritture", "Progetti che scrivono", "Rotte")
-        for tid, a in tables:
+        items = self.nodes("Table", "StoredProcedure", "Trigger")
+        schema = cg.meta.get("sqlSchema")
+        intro = ("Oggetti dallo schema SQL e dal codice. Letture e scritture sono quelle dirette di metodi, pagine e oggetti "
+                 "del database; le rotte sono quelle il cui dossier arriva all'oggetto."
+                 if schema is not None else
+                 "Schema SQL non fornito: tabelle e procedure vengono solo dal codice, senza colonne, vincoli e trigger.")
+        lines = self.page(f, "Database: tabelle, viste, stored procedure, funzioni e trigger") + [intro, ""]
+        lines += table("Nome", "Tipo", "Nello schema", "Usata dal codice", "Letture", "Scritture", "Chi scrive", "Rotte")
+        for tid, a in items:
             writers = {u for u, _ in cg.inc(tid, ["WRITES"])}
-            projects = sorted({str(cg.attrs(u).get("project") or "?") for u in writers})
-            kind = "stored procedure" if a.get("kind") == "StoredProcedure" else "tabella"
+            who = sorted({str(cg.attrs(u).get("project") or "database") for u in writers})
             readers = {u for u, _ in cg.inc(tid, ["READS", "CALLS_PROC"])}
-            lines.append(f"| {self.link(tid, f)} | {kind} | {a.get('source') or '-'} | {len(readers)} | {len(writers)} "
-                         f"| {cell(', '.join(projects)) or '-'} | {len(self.reached_by.get(tid, ()))} |")
+            lines.append(f"| {self.link(tid, f)} | {self.db_label(a).lower()} | {'si' if a.get('inSchema') else 'no'} "
+                         f"| {a.get('source') or '-'} | {len(readers)} | {len(writers)} | {cell(', '.join(who)) or '-'} "
+                         f"| {len(self.reached_by.get(tid, ()))} |")
         self.emit(f, lines)
-        for tid, _ in tables:
+        for tid, _ in items:
             self.write_table(tid)
 
     def write_table(self, tid: str) -> None:
         cg, a = self.cg, self.cg.attrs(tid)
-        f = self.loc[tid]
-        kind = "Stored procedure" if a.get("kind") == "StoredProcedure" else "Tabella"
-        lines = self.page(f, f"{kind} {label(a.get('name') or tid)}", ("Tabelle", "tables/INDEX.md")) + [
-            f"- Id: {code(tid)}",
-            f"- Origine: {a.get('source') or '-'} (ef = Entity Framework, sql = testo SQL nel codice o nel markup)"]
+        f, kind = self.loc[tid], a.get("kind")
+        lines = self.page(f, f"{self.db_label(a)} {label(a.get('name') or tid)}", ("Database", "tables/INDEX.md")) + [f"- Id: {code(tid)}"]
+        if a.get("inSchema"):
+            lines.append(f"- Definizione: {self.src(a, f)} (schema SQL)")
+        elif cg.meta.get("sqlSchema") is not None:
+            lines.append("- Definizione: non trovata nello schema SQL fornito (altro database, oggetto creato a runtime o schema incompleto)")
+        if a.get("source"):
+            lines.append(f"- Usata dal codice: {a['source']} (ef = Entity Framework, sql = testo SQL nel codice o nel markup)")
         if a.get("entity"):
             lines.append(f"- Entita': {code(a['entity'])}")
+        if kind == "Trigger":
+            lines.append(f"- Scatta: {a.get('timing') or 'AFTER'} {', '.join(a.get('events') or [])} su {code(a.get('table'))}")
+        if a.get("parameters"):
+            lines.append("- Parametri: " + ", ".join(code(x) for x in a["parameters"]))
+        flags = [x for x in (a.get("complexity") and f"complessita' {a['complexity']}",
+                             a.get("dynamic_sql") and "SQL dinamico: tabelle e procedure eseguite da stringhe non determinabili") if x]
+        if flags:
+            lines.append("- Note: " + ", ".join(flags))
         lines += self.edge_list(tid, f, "Mappata sul tipo", ["MAPPED_TO"])
         lines += self.edge_list(tid, f, "Dichiarata nel contesto", ["DECLARES_TABLE"], out=False) + [""]
+
+        if kind == "Table":
+            lines += self.column_lines(tid, f)
+            cons = [c for c in a.get("constraints") or [] if c.get("kind") != "PRIMARY KEY"]
+            lines += section(f"Vincoli ({len(cons)})", [
+                f"- {c['kind']}" + (f" {code(c['name'])}" if c.get("name") else "")
+                + (f" su {', '.join(code(x) for x in c.get('columns') or [])}" if c.get("columns") else "")
+                + (f": {code(c['expression'])}" if c.get("expression") else "")
+                + (f" verso {code(c['references'])}" if c.get("references") else "")
+                + (f", ON DELETE {c['onDelete']}" if c.get("onDelete") else "")
+                + (f" dove {code(c['filter'])}" if c.get("filter") else "")
+                + f" ({self.src({'file': c.get('file')}, f, c.get('line'))})" for c in cons])
+            refs = [f"- verso {self.ref(v, f)} ({', '.join(d.get('columns') or [])})" for v, d in cg.out(tid, ["REFERENCES"])]
+            refs += [f"- da {self.ref(u, f)} ({', '.join(d.get('columns') or [])})" for u, d in cg.inc(tid, ["REFERENCES"])]
+            lines += section("Chiavi esterne", refs)
+            lines += section("Trigger", [f"- {self.ref(v, f)}" for v, _ in cg.out(tid, ["TRIGGERS"])])
+        else:
+            body = sorted(cg.out(tid, DATA_EDGES), key=lambda x: (x[1]["type"], x[0]))
+            lines += section("Cosa fa", [f"- {d['type']} {self.ref(v, f)} ({self.src(a, f, d.get('line'))})" for v, d in body])
+            lines += section("Eccezioni", [f"- {code(x.get('type'))} {cell(x.get('message') or '')}"
+                                           + (f" se {code(x['condition'])}" if x.get("condition") else "")
+                                           + f" ({self.src(a, f, x.get('line'))})" for x in a.get("throws") or []])
         for title, etype in (("Scritture", "WRITES"), ("Letture", "READS"), ("Chiamate", "CALLS_PROC")):
             rows = sorted(cg.inc(tid, [etype]), key=lambda x: x[0])
-            body = [f"| {self.ref(u, f)} | {cg.attrs(u).get('project') or '-'} | {d.get('via') or '-'} "
+            body = [f"| {self.ref(u, f)} | {cg.attrs(u).get('project') or 'database'} | {d.get('via') or '-'} "
                     f"| {self.src(cg.attrs(u), f, d.get('line'))} |" for u, d in rows]
-            lines += section(f"{title} ({len(rows)})", table("Da", "Progetto", "Via", "Riga") + body if rows else [])
+            lines += section(f"{title} da codice e database ({len(rows)})", table("Da", "Progetto", "Via", "Riga") + body if rows else [])
         routes = sorted(self.reached_by.get(tid, ()))
         lines += section(f"Rotte che la raggiungono ({len(routes)})", bullets(routes, lambda r: self.ref(r, f), 100))
         self.emit(f, lines)
+
+    def column_lines(self, tid: str, f: str) -> list[str]:
+        """Dizionario dati: colonne dello schema, proprieta' delle entita' mappate e campi in ingresso con lo stesso nome."""
+        cg, a = self.cg, self.cg.attrs(tid)
+        columns = a.get("columns") or []
+        if not columns:
+            return []
+        props: dict[str, list[str]] = defaultdict(list)
+        for ent, _ in cg.out(tid, ["MAPPED_TO"]):
+            for p in cg.attrs(ent).get("properties") or []:
+                mapped = next((m.group(1) for x in p.get("attributes") or [] for m in [re.match(r'Column\(\s*"([^"]+)"', x)] if m), None)
+                attrs = [x for x in p.get("attributes") or [] if not x.startswith("Column")]
+                props[(mapped or p["name"]).lower()].append(f"{cg.attrs(ent).get('name')}.{p['name']}" + (f" [{', '.join(attrs)}]" if attrs else ""))
+        inputs: dict[str, set[str]] = defaultdict(set)
+        for rid, tables in self.route_tables.items():
+            if tables.get(tid, (False, False))[1]:
+                for name, where in self.route_inputs.get(rid, {}).items():
+                    inputs[name] |= where
+        cons: dict[str, list[str]] = defaultdict(list)
+        for c in a.get("constraints") or []:
+            short = {"PRIMARY KEY": "PK", "FOREIGN KEY": f"FK {c.get('references')}"}.get(c["kind"], c["kind"])
+            for col in c.get("columns") or []:
+                cons[col.lower()].append(short)
+        rows = []
+        for col in columns:
+            key = col["name"].lower()
+            value = " ".join(x for x in (col.get("identity") and "identity", col.get("default") and f"default {col['default']}",
+                                         col.get("computed") and f"calcolata {col['computed']}") if x)
+            rows.append(f"| {code(col['name'])} | {code(col.get('type'))} | {'si' if col.get('nullable') else 'no'} | {cell(value) or '-'} "
+                        f"| {cell(', '.join(cons.get(key, []))) or '-'} | {cell(', '.join(props.get(key, []))) or '-'} "
+                        f"| {cell(joined(sorted(inputs.get(key, [])), cap=4)) or '-'} |")
+        return section(f"Colonne ({len(columns)})", [
+            "Proprieta' e campi in ingresso corrispondono alla colonna per nome (o per [Column]): e' un'euristica, "
+            "il percorso reale del valore va verificato nel codice.", ""]
+            + table("Colonna", "Tipo", "Null", "Valore", "Vincoli", "Proprieta' dell'entita'", "Campi in ingresso (per nome)") + rows)
 
     # ------------------------------------------------------------------ viste e pagine
 
@@ -620,6 +787,9 @@ class Docs:
     def write_reports(self) -> None:
         self.report_authorization()
         self.report_data_ownership()
+        self.report_domains()
+        self.report_database()
+        self.report_configuration()
         self.report_state()
         self.report_integrations()
         self.report_hotspots()
@@ -631,7 +801,7 @@ class Docs:
     def report_authorization(self) -> None:
         cg, f = self.cg, "reports/authorization.md"
         unprotected = {r for rs in self.groups.values() for r in rs
-                       if not cg.attrs(r).get("authorization") and cg.attrs(r).get("flavor") != "global"}
+                       if not cg.attrs(r).get("authorization") and cg.attrs(r).get("flavor") in NETWORK_FLAVORS}
         lines = ["## Per gruppo", "", "Il dettaglio di ogni rotta e' nell'indice del suo gruppo.", ""]
         lines += table("Gruppo", "Rotte", "Senza autorizzazione", "Regole usate")
         for group, routes in self.groups.items():
@@ -641,9 +811,11 @@ class Docs:
         lines += ["", f"## Rotte senza autorizzazione dichiarata ({len(unprotected)})", ""]
         lines += [f"- {self.ref(r, f)}" for r in sorted(unprotected)]
         self.report(f, "Autorizzazioni per rotta",
-                    "Fonti lette: attributi [Authorize] e [AllowAnonymous] (anche ereditati da controller e metodi base) "
-                    "e, per Web Forms, le regole `<authorization>` dei web.config. Non lette: filtri globali "
-                    "(FilterConfig), controlli nel codice (User.IsInRole, verifiche manuali), moduli HTTP.", lines)
+                    "Fonti lette: attributi [Authorize] e [AllowAnonymous] (anche ereditati da controller e metodi base, "
+                    "anche sugli hub SignalR), [PrincipalPermission] e, per Web Forms e servizi .svc, le regole "
+                    "`<authorization>` dei web.config. Non lette: filtri globali (FilterConfig), controlli nel codice "
+                    "(User.IsInRole, verifiche manuali), anche dentro i moduli HTTP (che compaiono tra gli entry point). "
+                    "Batch, job, servizi Windows, timer e handler di messaggi non sono contati: non arrivano dalla rete.", lines)
 
     def report_data_ownership(self) -> None:
         cg, f = self.cg, "reports/data-ownership.md"
@@ -669,6 +841,97 @@ class Docs:
         self.report(f, "Proprieta' dei dati",
                     "Quali gruppi di entry point scrivono e leggono ogni tabella, aggregando il dossier di ogni rotta. "
                     "Una tabella scritta da piu' gruppi e' un confine da decidere prima di dividere in servizi.", lines)
+
+    def report_domains(self) -> None:
+        """Domini candidati: comunita' (Louvain) sul grafo gruppi di entry point - tabelle, scritture pesate piu' delle letture."""
+        from networkx import Graph
+        from networkx.algorithms.community import louvain_communities
+        f, g = "reports/domains.md", Graph()
+        for group, routes in self.groups.items():
+            g.add_node(("g", group))
+            for r in routes:
+                for tid, (_, writes) in self.route_tables[r].items():
+                    old = g.get_edge_data(("g", group), ("t", tid), {}).get("weight", 0)
+                    g.add_edge(("g", group), ("t", tid), weight=max(old, 3 if writes else 1))
+        isolated = sorted(n[1] for n in g.nodes if n[0] == "g" and g.degree(n) == 0)
+        g.remove_nodes_from([("g", x) for x in isolated])
+        communities = [c for c in louvain_communities(g, weight="weight", seed=42) if any(n[0] == "g" for n in c)] if g.number_of_edges() else []
+        communities.sort(key=lambda c: (-len(c), sorted(c)))
+        home = {n: i for i, c in enumerate(communities) for n in c}
+        writers: dict[str, set[int]] = defaultdict(set)
+        for node in (n for n in g.nodes if n[0] == "t"):
+            writers[node[1]] |= {home[nb] for nb in g.neighbors(node) if g[node][nb]["weight"] == 3}
+        lines = []
+        for i, com in enumerate(communities):
+            groups = sorted(n[1] for n in com if n[0] == "g")
+            tables = sorted(n[1] for n in com if n[0] == "t")
+            own = [x for x in tables if writers.get(x) == {i}]
+            shared = [x for x in tables if len(writers.get(x, ())) > 1]
+            read_elsewhere = sorted({n[1] for gr in groups for n in g.neighbors(("g", gr)) if home[n] != i})
+            lines += [f"## Candidato {i + 1}", "",
+                      "- Entry point: " + joined(groups, lambda x: f"[{label(x)}]({self.rel(self.group_file[x], f)})", 30),
+                      "- Tabelle scritte solo da qui: " + (joined(own, lambda x: self.link(x, f), 30) or "-"),
+                      "- Tabelle condivise con altri candidati (scritte da piu' parti): " + (joined(shared, lambda x: self.link(x, f), 30) or "-"),
+                      "- Tabelle di altri candidati usate da qui: " + (joined(read_elsewhere, lambda x: self.link(x, f), 30) or "-"), ""]
+        if isolated:
+            lines += [f"## Entry point senza dati ({len(isolated)})", "", "Non leggono ne' scrivono tabelle: vanno assegnati a mano.", "",
+                      *bullets(isolated, lambda x: f"[{label(x)}]({self.rel(self.group_file[x], f)})", 100)]
+        self.report(f, "Domini candidati",
+                    "Raggruppamento automatico dei gruppi di entry point in base ai dati che usano (algoritmo di Louvain sul grafo "
+                    "gruppi-tabelle; una scrittura pesa 3, una lettura 1). E' un punto di partenza per la capability map, "
+                    "non una decisione: i nomi dei domini e i confini li decidono le persone. Le tabelle condivise sono i "
+                    "punti di accoppiamento da risolvere prima di separare i servizi.", lines)
+
+    def report_database(self) -> None:
+        f, schema = "reports/database.md", self.cg.meta.get("sqlSchema")
+        if schema is None:
+            self.report(f, "Database", "Schema SQL non fornito: rigenera il grafo con --sql. Senza schema mancano colonne, "
+                                       "vincoli, trigger e la logica delle stored procedure.", [])
+            return
+        objects = self.nodes("Table", "StoredProcedure", "Trigger")
+        counts: dict[str, int] = defaultdict(int)
+        for _, a in objects:
+            if a.get("inSchema"):
+                counts[self.db_label(a)] += 1
+        lines = section("Contenuto dello schema", table("Tipo", "Quanti") + [f"| {k} | {v} |" for k, v in sorted(counts.items())]
+                        + ["", f"File letti: {schema.get('fileCount', 0)}."])
+        logic = [(n, a) for n, a in objects if a.get("kind") in ("StoredProcedure", "Trigger") and a.get("inSchema")]
+        logic.sort(key=lambda x: (-len(x[1].get("throws") or []), -int(x[1].get("complexity") or 1), x[0]))
+        lines += section("Logica nel database", table("Oggetto", "Tipo", "Eccezioni", "Complessita'", "Righe", "Raggiunto da rotte") + [
+            f"| {self.link(n, f)} | {self.db_label(a).lower()} | {len(a.get('throws') or [])} | {a.get('complexity', '-')} "
+            f"| {a.get('loc', '-')} | {len(self.reached_by.get(n, ()))} |" for n, a in logic])
+        dynamic = [n for n, a in objects if a.get("dynamic_sql")]
+        lines += section(f"SQL dinamico ({len(dynamic)})", ["Eseguono stringhe SQL: cosa leggono e scrivono va letto a mano.", ""]
+                         + [f"- {self.ref(n, f)}" for n in dynamic] if dynamic else [])
+        unused = [n for n, a in objects if a.get("inSchema") and not self.reached_by.get(n)]
+        lines += section(f"Oggetti dello schema non raggiunti da nessun entry point ({len(unused)})", [
+            "Possono servire ad altri sistemi, a job di SQL Server Agent, a report, o essere inutilizzati: chiedilo prima di "
+            "escluderli dalla migrazione.", ""] + [f"- {self.ref(n, f)}" for n in unused] if unused else [])
+        self.report(f, "Database", "Cosa contiene lo schema SQL fornito e quanta logica vive nel database.", lines)
+
+    def report_configuration(self) -> None:
+        cg, f = self.cg, "reports/configuration.md"
+        lines = []
+        for nid, a in self.nodes("Config"):
+            values = a.get("values") or []
+            notes = []
+            if a.get("missing") or not values:
+                notes.append("nessun valore nei file del repository: chiedi il valore di produzione")
+            elif not any(v.get("environment") for v in values):
+                notes.append("solo il valore base: chiedi se in produzione cambia")
+            if a.get("secret"):
+                notes.append("valore mascherato perche' sembra un segreto")
+            users = sorted(cg.inc(nid, ["USES_CONFIG"]), key=lambda x: x[0])
+            lines += [f'<a id="{anchor(nid)}"></a>', "", f"## {label(a.get('name'))}", "", f"- Id: {code(nid)}",
+                      "- Valori: " + self.config_text(values, f),
+                      "- Letta da: " + (", ".join(f"{self.link(u, f)} ({self.src(cg.attrs(u), f, d.get('line'))})" for u, d in users) or "-")]
+            lines += [f"- Nota: {'; '.join(notes)}"] if notes else []
+            lines.append("")
+        self.report(f, "Configurazione",
+                    "Chiavi appSettings di web.config, app.config e delle trasformazioni (Web.Release.config, ...), con i metodi "
+                    "che le leggono. I valori di produzione spesso non sono nel repository (trasformazioni al deploy, variabili "
+                    "della pipeline, file esterni): quando mancano vanno chiesti; se non sono disponibili, una regola che ne "
+                    "dipende dichiara il valore ipotizzato.", lines)
 
     def report_state(self) -> None:
         f = "reports/implicit-state.md"
@@ -715,6 +978,17 @@ class Docs:
         cg, f, meta = self.cg, "reports/gaps.md", self.cg.meta
         failures = meta.get("workspaceFailures") or []
         lines = [f"## Avvisi del caricamento dei progetti ({len(failures)})", ""] + [f"- {cell(x)}" for x in failures[:50]] + [""]
+        schema = meta.get("sqlSchema")
+        if schema is None:
+            lines += ["## Schema SQL non fornito", "", "Il grafo e' stato generato con --no-sql: vincoli, trigger e logica delle stored "
+                      "procedure non ci sono. Rigeneralo con --sql.", ""]
+        else:
+            errors = schema.get("parseErrors") or []
+            lines += section(f"Blocchi SQL non interpretati ({len(errors)})", [f"- {cell(x)}" for x in errors])
+            missing = [n for n, a in self.nodes("Table", "StoredProcedure") if a.get("source") and not a.get("inSchema")]
+            lines += section(f"Usati dal codice ma assenti dallo schema ({len(missing)})", [
+                "Altro database, oggetti creati a runtime, nomi costruiti male dall'euristica SQL o schema incompleto.", ""]
+                + [f"- {self.ref(n, f)}" for n in missing] if missing else [])
         errors = [f"- {self.link(n, f)}: {a['declarationErrors']} errori" for n, a in cg.g.nodes(data=True)
                   if a.get("kind") == "Project" and a.get("declarationErrors")]
         intro = "Di solito riferimenti NuGet non ripristinati: le chiamate verso quei tipi non diventano archi."
@@ -748,10 +1022,12 @@ class Docs:
                  f"({meta.get('tool') or '?'}, {meta.get('generatedAt') or 'data non indicata'}). "
                  f"Riassunti LLM disponibili: {len(cg.summaries)}.", "",
                  "## Come usare questa documentazione", "",
-                 "1. Parti dagli [entry point](routes/INDEX.md): ogni action MVC/Web API, pagina Web Forms, metodo asmx e "
-                 "Global.asax ha un dossier con metodi raggiunti, dati, viste, stato implicito, validazioni ed eccezioni.",
-                 "2. I link portano alla scheda di ogni metodo, tipo, tabella e vista. Ogni nodo ha un id per esteso "
-                 "(`M:`, `T:`, `R:`, `DB:`, `SP:`, `V:`, `P:`): cercalo in questa cartella per trovare tutti i punti in cui compare.",
+                 "1. Parti dagli [entry point](routes/INDEX.md): ogni action MVC/Web API, pagina Web Forms, servizio asmx o WCF, "
+                 "batch, job, handler di messaggi, modulo HTTP e Global.asax ha un dossier con metodi raggiunti, logica nel "
+                 "database, dati e vincoli, viste, stato implicito, configurazione, validazioni ed eccezioni.",
+                 "2. I link portano alla scheda di ogni metodo, tipo, tabella, procedura, trigger e vista. Ogni nodo ha un id per "
+                 "esteso (`M:`, `T:`, `R:`, `DB:`, `SP:`, `TR:`, `CFG:`, `V:`, `P:`): cercalo in questa cartella per trovare tutti "
+                 "i punti in cui compare.",
                  "3. Il codice non e' copiato qui: ogni scheda indica file e riga. Leggi il sorgente solo dove serve.",
                  "4. Gli archi con via `sql` o `ef-tracking` sono dedotti da euristiche: verificali sul sorgente.",
                  "5. Riassunti e casi d'uso marcati \"da validare\" vengono da un LLM: sono indizi, non prove.", ""]
@@ -768,17 +1044,24 @@ class Docs:
 
         tables = [n for n, a in cg.g.nodes(data=True) if a.get("kind") == "Table"]
         written = sorted(tables, key=lambda t: -len(cg.inc(t, ["WRITES"])))[:15]
-        lines += section(f"Dati ({len(tables)} tabelle, {counts.get('StoredProcedure', 0)} stored procedure)", [
+        lines += section(f"Dati ({len(tables)} tabelle e viste, {counts.get('StoredProcedure', 0)} stored procedure e funzioni, "
+                         f"{counts.get('Trigger', 0)} trigger)", [
             "Tabelle con piu' scrittori: " + (", ".join(self.link(t, f) for t in written) or "-") + ".", "",
             "Tutte le tabelle: [tables/INDEX.md](tables/INDEX.md) · viste e pagine: [views/INDEX.md](views/INDEX.md)"])
         lines += section("Report", [
             "- [Autorizzazioni](reports/authorization.md): regole per rotta e rotte senza autorizzazione dichiarata",
             "- [Proprieta' dei dati](reports/data-ownership.md): chi scrive ogni tabella, per gruppo di entry point",
+            "- [Domini candidati](reports/domains.md): gruppi di entry point raggruppati per dati usati, base per la capability map",
+            "- [Database](reports/database.md): contenuto dello schema, logica nel database, SQL dinamico, oggetti non raggiunti",
+            "- [Configurazione](reports/configuration.md): valori delle chiavi per file e ambiente, chiavi senza valore",
             "- [Stato implicito](reports/implicit-state.md): Session, ViewState, TempData, ViewBag, Cache",
             "- [Integrazioni](reports/integrations.md): email, http, wcf, code, file system, sql",
             "- [Punti caldi](reports/hotspots.md): complessita', lunghezza, logica nel markup",
             "- [Lacune](reports/gaps.md): chiamate, viste, link e gestori non risolti, avvisi di caricamento"])
+        schema = meta.get("sqlSchema")
         lines += section("Qualita' dell'estrazione", [
+            "- Schema SQL: " + ("non fornito (--no-sql)" if schema is None
+                                else f"{schema.get('fileCount', 0)} file, {len(schema.get('parseErrors') or [])} blocchi non interpretati"),
             f"- Avvisi del caricamento dei progetti: {len(meta.get('workspaceFailures') or [])}",
             f"- Metodi con chiamate non risolte: {sum(1 for _, a in cg.g.nodes(data=True) if a.get('unresolved_calls'))}",
             f"- Viste non trovate: {sum(1 for _, a in self.nodes('View') if a.get('unresolved'))}",

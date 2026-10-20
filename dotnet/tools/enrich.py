@@ -16,12 +16,16 @@ Esempi:
 from __future__ import annotations
 
 import argparse
+import asyncio
+import atexit
 import concurrent.futures as cf
 import hashlib
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 import threading
 import time
 from collections import Counter
@@ -62,9 +66,10 @@ Regole:
 - Lingua delle descrizioni: {lang}."""
 
 ROUTE_SYSTEM = """Sei un analista funzionale che ricostruisce la specifica AS-IS di un caso d'uso di un'applicazione legacy.
-Ricevi il dossier di una rotta web, estratto dal grafo del codice: entry point, autorizzazioni, metodi raggiunti
-(con i loro riassunti e regole), tabelle lette e scritte, viste e campi, redirect, integrazioni, stato di sessione,
-validazioni ed eccezioni.
+Ricevi il dossier di un entry point (rotta web, servizio, batch, job, handler di messaggi), estratto dal grafo del
+codice e dello schema SQL: autorizzazioni, metodi raggiunti (con i loro riassunti e regole), logica nel database
+(stored procedure e trigger), tabelle lette e scritte con i loro vincoli, viste e campi, redirect, integrazioni, stato
+di sessione, configurazione con i valori, validazioni ed eccezioni.
 
 Rispondi SOLO con un oggetto JSON valido, senza testo prima o dopo, con questa forma:
 {
@@ -85,6 +90,7 @@ Rispondi SOLO con un oggetto JSON valido, senza testo prima o dopo, con questa f
 
 Regole:
 - Ogni regola cita gli id dei nodi del dossier da cui deriva. Non inventare comportamenti assenti dal dossier.
+- Vincoli CHECK, trigger e RAISERROR delle procedure sono regole come il codice C#.
 - Le informazioni mancanti diventano open_questions o regole con confidence GAP.
 - Lingua delle descrizioni: {lang}."""
 
@@ -135,6 +141,67 @@ class OpenAICompatibleLLM:
         return resp.choices[0].message.content or ""
 
 
+class CopilotLLM:
+    """
+    GitHub Copilot con il Copilot SDK (pip install github-copilot-sdk, Python 3.11+). Usa l'utente autenticato in
+    Copilot CLI oppure il token in COPILOT_GITHUB_TOKEN. Ogni prompt e' una sessione nuova in modalita' "empty": nessuno
+    strumento, nessuna istruzione del repository, nessuna memoria, cartella di lavoro vuota. Il modello vede solo il
+    prompt. Telemetria GitHub disattivata. Senza --model decide Copilot; --max-tokens non si applica.
+    """
+
+    TIMEOUT = 600  # secondi per risposta: i prompt dei metodi arrivano a 24.000 caratteri
+
+    def __init__(self, model: str | None):
+        if sys.version_info < (3, 11):
+            sys.exit("--provider copilot richiede Python 3.11 o successivo (github-copilot-sdk 1.x)")
+        os.environ["COPILOT_GITHUB_TELEMETRY_DISABLED"] = "true"  # letta dal runtime all'avvio
+        from copilot import CopilotClient  # pip install github-copilot-sdk
+        from copilot.rpc import PermissionDecisionReject
+        from copilot.session_events import AssistantMessageData
+        self.name, self.model, self._message_type = f"copilot/{model or 'default'}", model, AssistantMessageData
+        self._reject = lambda request, invocation: PermissionDecisionReject(feedback="strumenti disattivati")
+        self._workdir = tempfile.mkdtemp(prefix="enrich-copilot-")
+        # l'SDK e' asincrono: un event loop in un thread dedicato serve le chiamate dei thread di run_parallel
+        self._loop = asyncio.new_event_loop()
+        threading.Thread(target=self._loop.run_forever, daemon=True).start()
+        # la modalita' "empty" vuole una cartella dati esplicita: quella di Copilot CLI, dove c'e' l'accesso gia' fatto
+        home = os.environ.get("COPILOT_HOME") or os.path.join(os.path.expanduser("~"), ".copilot")
+        self._client = CopilotClient(mode="empty", base_directory=home,
+                                     github_token=os.environ.get("COPILOT_GITHUB_TOKEN") or None)
+        self._run(self._client.start(), 120)
+        atexit.register(self.close)
+        if model:
+            available = sorted(m.id for m in self._run(self._client.list_models(), 60))
+            if model not in available:
+                sys.exit(f"modello {model!r} non disponibile in Copilot. Disponibili: {', '.join(available)}")
+
+    def _run(self, coro, timeout: float):
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout)
+
+    async def _ask(self, system: str, user: str) -> str:
+        session = await self._client.create_session(
+            model=self.model, system_message={"mode": "replace", "content": system}, available_tools=[],
+            on_permission_request=self._reject, working_directory=self._workdir, infinite_sessions={"enabled": False})
+        try:
+            reply = await session.send_and_wait(user, timeout=self.TIMEOUT)
+        finally:
+            await session.disconnect()
+        if reply is None or not isinstance(reply.data, self._message_type):
+            raise RuntimeError("Copilot non ha restituito una risposta")
+        return reply.data.content
+
+    def complete(self, system: str, user: str) -> str:
+        return self._run(self._ask(system, user), self.TIMEOUT + 60)
+
+    def close(self) -> None:
+        try:
+            self._run(self._client.stop(), 30)
+        except Exception as ex:
+            print(f"[warn] arresto del runtime Copilot: {ex}", file=sys.stderr)
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        shutil.rmtree(self._workdir, ignore_errors=True)
+
+
 class FakeLLM:
     """Nessuna chiamata di rete: produce JSON plausibili dai fatti nel prompt. Serve per provare la pipeline e i costi."""
     name = "fake"
@@ -153,11 +220,16 @@ class FakeLLM:
                            "open_questions": [], "migration_notes": []})
 
 
-def make_llm(args):
+def make_llm(args, default_model: str):
+    """default_model vale solo per anthropic: con copilot senza --model decide Copilot, con openai --model serve sempre."""
     if args.provider == "anthropic":
-        return AnthropicLLM(args.model, args.max_tokens)
+        return AnthropicLLM(args.model or default_model, args.max_tokens)
     if args.provider == "openai":
+        if not args.model:
+            sys.exit("--provider openai richiede --model (nome del modello o del deployment)")
         return OpenAICompatibleLLM(args.model, args.max_tokens, args.base_url)
+    if args.provider == "copilot":
+        return CopilotLLM(args.model)
     return FakeLLM()
 
 
@@ -319,7 +391,7 @@ def route_dossier(cg: CodeGraph, trace: dict, budget_chars: int) -> str:
         item.update((k, v) for k, v in (("rules", s.get("business_rules")), ("side_effects", s.get("side_effects")),
                                         ("flags", m.get("flags"))) if v)
         methods.append(item)
-    dossier = {k: v for k, v in trace.items() if k not in ("methods", "note")} | {"methods": methods}
+    dossier = {k: v for k, v in trace.items() if k not in ("methods", "note", "seam")} | {"methods": methods}
     text = "## Dossier rotta\n" + json.dumps(dossier, ensure_ascii=False, indent=1)
     return text if len(text) <= budget_chars else text[:budget_chars] + "\n[...troncato...]"
 
@@ -424,9 +496,11 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--graph", required=True)
     ap.add_argument("--root", help="cartella della solution (default: meta.root del grafo)")
     ap.add_argument("--summaries", default="summaries.jsonl", help="file JSONL di uscita (append, incrementale)")
-    ap.add_argument("--provider", required=True, choices=["anthropic", "openai", "fake"],
-                    help="anthropic e openai inviano il sorgente al modello; fake non fa chiamate di rete")
-    ap.add_argument("--model", default=os.environ.get("ENRICH_MODEL", "claude-sonnet-5-5"))
+    ap.add_argument("--provider", required=True, choices=["anthropic", "openai", "copilot", "fake"],
+                    help="anthropic, openai e copilot inviano il sorgente al modello; fake non fa chiamate di rete")
+    ap.add_argument("--model", default=os.environ.get("ENRICH_MODEL"),
+                    help="default: claude-sonnet-5-5 con anthropic, il modello predefinito con copilot; "
+                         "obbligatorio con openai")
     ap.add_argument("--base-url", help="endpoint per --provider openai (es. vLLM on-premise)")
     ap.add_argument("--max-tokens", type=int, default=2000)
     ap.add_argument("--concurrency", type=int, default=4)
@@ -444,7 +518,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.dump_prompts:
         os.makedirs(args.dump_prompts, exist_ok=True)
     cg = CodeGraph(args.graph, root=args.root, summaries_path=args.summaries, redact=not args.no_redact)
-    llm = make_llm(args)
+    llm = make_llm(args, "claude-sonnet-5-5")
     if not args.routes_only:
         enrich_methods(cg, llm, args)
     if args.routes or args.routes_only:

@@ -1,16 +1,36 @@
 // Stub minimi di System.Web (Web Forms, asmx, routing): solo cio' che usa l'app d'esempio.
 namespace System.Web
 {
-    public class HttpContext { }
-    public class HttpResponse { public void Redirect(string url) { } public void Redirect(string url, bool endResponse) { } }
+    public class HttpContext
+    {
+        public static HttpContext Current => null;
+        public HttpRequest Request => null;
+        public HttpResponse Response => null;
+        public System.Security.Principal.IPrincipal User => null;
+    }
+    public class HttpResponse
+    {
+        public string ContentType { get; set; }
+        public void Write(string s) { }
+        public void Redirect(string url) { }
+        public void Redirect(string url, bool endResponse) { }
+    }
     public class HttpServerUtility { public void Transfer(string path) { } }
     public class HttpRequest
     {
+        public string Path => null;
         public System.Collections.Specialized.NameValueCollection QueryString => null;
         public string this[string key] => null;
     }
+    public class HttpException : Exception { public HttpException(int httpCode, string message) : base(message) { } }
     public interface IHttpHandler { void ProcessRequest(HttpContext context); bool IsReusable { get; } }
-    public class HttpApplication { public SessionState.HttpSessionState Session => null; }
+    public interface IHttpModule { void Init(HttpApplication context); void Dispose(); }
+    public class HttpApplication
+    {
+        public SessionState.HttpSessionState Session => null;
+        public HttpContext Context => null;
+        public event EventHandler BeginRequest { add { } remove { } }
+    }
 }
 
 namespace System.Web.SessionState

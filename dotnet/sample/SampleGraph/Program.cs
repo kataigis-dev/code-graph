@@ -1,16 +1,22 @@
 // Esegue l'estrattore sull'app d'esempio senza MSBuild:
-//   dotnet run --project sample/SampleGraph -- sample/app sample/graph.sample.json
+//   dotnet run --project sample/SampleGraph -- sample/app sample/graph.sample.json --sql sample/app/Database
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.Text;
 using RoslynGraph;
 
-if (args.Length < 2) { Console.Error.WriteLine("uso: SampleGraph <cartella app> <graph.json>"); return 2; }
+if (args.Length < 2) { Console.Error.WriteLine("uso: SampleGraph <cartella app> <graph.json> [--sql <script o cartella>]..."); return 2; }
 var appRoot = Path.GetFullPath(args[0]);
 var outPath = Path.GetFullPath(args[1]);
+var sql = args.Skip(2).Chunk(2).Where(a => a is ["--sql", _]).Select(a => Path.GetFullPath(a[1])).ToList();
 
-// progetti dell'app d'esempio: cartella -> riferimenti
-var layout = new (string Dir, string[] Deps)[] { ("Data", []), ("Core", ["Data"]), ("Web", ["Core", "Data"]), ("Legacy", ["Data"]) };
+// progetti dell'app d'esempio: cartella -> riferimenti e tipo di output
+var layout = new (string Dir, string[] Deps, OutputKind Kind)[]
+{
+    ("Data", [], OutputKind.DynamicallyLinkedLibrary), ("Core", ["Data"], OutputKind.DynamicallyLinkedLibrary),
+    ("Web", ["Core", "Data"], OutputKind.DynamicallyLinkedLibrary), ("Legacy", ["Data"], OutputKind.DynamicallyLinkedLibrary),
+    ("Batch", ["Core", "Data"], OutputKind.ConsoleApplication),
+};
 
 var framework = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator)
     .Where(p => Path.GetFileName(p) is var f && (f.StartsWith("System.", StringComparison.Ordinal) || f is "mscorlib.dll" or "netstandard.dll" or "Microsoft.CSharp.dll"))
@@ -31,14 +37,14 @@ var references = framework.Append(MetadataReference.CreateFromImage(stubImage.To
 
 var solution = new AdhocWorkspace().CurrentSolution;
 var ids = new Dictionary<string, ProjectId>();
-foreach (var (dir, deps) in layout)
+foreach (var (dir, deps, kind) in layout)
 {
     var folder = Path.Combine(appRoot, dir);
     if (!Directory.Exists(folder)) continue;
     var name = "Shop." + dir;
     var pid = ids[dir] = ProjectId.CreateNewId(name);
     solution = solution.AddProject(ProjectInfo.Create(pid, VersionStamp.Default, name, name, LanguageNames.CSharp,
-        filePath: Path.Combine(folder, name + ".csproj"), compilationOptions: options,
+        filePath: Path.Combine(folder, name + ".csproj"), compilationOptions: options.WithOutputKind(kind),
         parseOptions: new CSharpParseOptions(LanguageVersion.Latest, DocumentationMode.Parse),
         metadataReferences: references,
         projectReferences: deps.Where(ids.ContainsKey).Select(d => new ProjectReference(ids[d]))));
@@ -56,10 +62,10 @@ foreach (var p in solution.Projects)
 if (errors > 0) { Console.Error.WriteLine($"{errors} errori di compilazione nell'app d'esempio"); return 1; }
 
 var graph = new CodeGraph();
-await new Extractor(graph, appRoot, new Options { Input = "Shop.sln" }).RunAsync(solution);
+await new Extractor(graph, appRoot, new Options { Input = "Shop.sln", SqlPaths = sql, NoSql = sql.Count == 0 }).RunAsync(solution);
 // i csproj dell'esempio sono virtuali (niente MSBuild): non ha senso indicarli come file
 foreach (var n in graph.Nodes.Values.Where(n => n.Kind == "Project")) n.Props.Remove("file");
-graph.Meta["tool"] = "roslyn-graph 0.2 (sample)";
+graph.Meta["tool"] = "roslyn-graph 0.3 (sample)";
 graph.Meta["input"] = "Shop.sln";
 // radice relativa: codegraph.py la risolve rispetto alla cartella di graph.json
 graph.Meta["root"] = Path.GetRelativePath(Path.GetDirectoryName(outPath)!, appRoot).Replace('\\', '/');

@@ -8,6 +8,11 @@ try { opt = Options.Parse(args); }
 catch (ArgumentException ex) { Console.Error.WriteLine(ex.Message); opt = null; }
 if (opt is null) { Options.PrintUsage(); return 2; }
 if (!File.Exists(opt.Input)) { Console.Error.WriteLine($"file non trovato: {opt.Input}"); return 2; }
+foreach (var sql in opt.SqlPaths.Where(s => !File.Exists(s) && !Directory.Exists(s)))
+{
+    Console.Error.WriteLine($"schema SQL non trovato: {sql}");
+    return 2;
+}
 
 // Roslyn >= 4.9: MSBuildWorkspace valuta i progetti in un BuildHost esterno (net472 per i csproj legacy,
 // che usa l'MSBuild di Visual Studio/Build Tools). Non serve registrare MSBuild con MSBuildLocator.
@@ -35,7 +40,7 @@ var graph = new CodeGraph();
 await new Extractor(graph, root, opt).RunAsync(solution);
 
 var counts = graph.Nodes.Values.GroupBy(n => n.Kind).ToDictionary(g => g.Key, g => g.Count());
-graph.Meta["tool"] = "roslyn-graph 0.2";
+graph.Meta["tool"] = "roslyn-graph 0.3";
 graph.Meta["input"] = Path.GetFileName(input);
 graph.Meta["root"] = Path.GetFullPath(root);
 graph.Meta["generatedAt"] = DateTimeOffset.Now.ToString("O");
@@ -59,6 +64,8 @@ namespace RoslynGraph
         public string? Root { get; init; }
         public string Configuration { get; init; } = "Debug";
         public bool IncludeTests { get; init; }
+        public List<string> SqlPaths { get; init; } = new();
+        public bool NoSql { get; init; }
 
         public static Options? Parse(string[] args)
         {
@@ -74,9 +81,15 @@ namespace RoslynGraph
                     "--root" => o with { Root = Next() },
                     "--configuration" => o with { Configuration = Next() },
                     "--include-tests" => o with { IncludeTests = true },
+                    "--sql" => o with { SqlPaths = [.. o.SqlPaths, Next()] },
+                    "--no-sql" => o with { NoSql = true },
                     _ => throw new ArgumentException($"opzione sconosciuta: {args[i]}"),
                 };
             }
+            if (o.SqlPaths.Count == 0 && !o.NoSql)
+                throw new ArgumentException("manca lo schema SQL: --sql <script .sql o cartella>. Va fornito sempre insieme al codice; "
+                                            + "--no-sql per procedere senza (vincoli, trigger e stored procedure resteranno fuori)");
+            if (o.SqlPaths.Count > 0 && o.NoSql) throw new ArgumentException("--sql e --no-sql si escludono");
             return o;
         }
 
@@ -88,9 +101,13 @@ namespace RoslynGraph
               --root <cartella>       radice per i percorsi relativi (default: cartella della solution)
               --configuration <cfg>   configurazione MSBuild (default: Debug)
               --include-tests         include i progetti di test
+              --sql <file|cartella>   schema del database: script .sql (SSMS "Genera script", progetto SSDT,
+                                      SqlPackage /Action:Script). Obbligatorio, ripetibile
+              --no-sql                procedi senza schema (sconsigliato: perdi vincoli, trigger e stored procedure)
 
             Prima di lanciarlo: ripristina i pacchetti (nuget restore / msbuild -t:restore),
             altrimenti i simboli esterni non si risolvono e il grafo perde archi.
+            Metti gli script SQL dentro la radice dei sorgenti: fuori, link e righe non sono leggibili.
             """);
     }
 }

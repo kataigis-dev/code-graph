@@ -6,11 +6,14 @@ namespace RoslynGraph;
 
 /// <summary>
 /// Costruisce il grafo in cinque passate:
+///  0. schema SQL (Extractor.Sql.cs): tabelle, colonne, vincoli, viste, stored procedure, funzioni, trigger
 ///  1. dichiarazioni (qui): progetti, tipi, metodi, ereditarieta', dispatch interfaccia->implementazione, DbContext/DbSet
 ///  2. MVC (qui): controller, action, rotte, verbi, autorizzazioni
 ///  3. corpi dei metodi (Extractor.Code.cs): chiamate, tabelle (EF e SQL), stato implicito, config, validazioni, eccezioni
 ///  4. viste Razor (Extractor.Razor.cs): modello, campi legati, link e form verso le rotte, partial, layout
-///  5. Web Forms (Extractor.WebForms.cs): pagine, controlli, master, servizi asmx, handler ashx, Global.asax, web.config
+///  5. Web Forms (Extractor.WebForms.cs): pagine, controlli, master, servizi asmx e svc, handler ashx, Global.asax, web.config
+///  6. altri entry point (Extractor.EntryPoints.cs): WCF, Windows Service, batch, job, timer, messaggi, moduli e handler HTTP, hub
+///  7. configurazione (Extractor.Config.cs): valori delle chiavi appSettings per file e ambiente
 /// </summary>
 public sealed partial class Extractor(CodeGraph graph, string root, Options opt)
 {
@@ -64,16 +67,22 @@ public sealed partial class Extractor(CodeGraph graph, string root, Options opt)
         }
         _g.Meta["projects"] = projectMeta;
 
-        Info("passata 1/5: dichiarazioni");
+        Info("passata 0/7: schema SQL");
+        PassSql();
+        Info("passata 1/7: dichiarazioni");
         foreach (var (p, comp) in _units) PassDeclarations(p, comp);
-        Info("passata 2/5: controller e rotte");
+        Info("passata 2/7: controller e rotte");
         PassMvc();
-        Info($"passata 3/5: corpi di {_bodies.Count} metodi");
+        Info($"passata 3/7: corpi di {_bodies.Count} metodi");
         _bodies.ForEach(PassBody);
-        Info("passata 4/5: viste Razor");
+        Info("passata 4/7: viste Razor");
         PassRazor();
-        Info("passata 5/5: Web Forms e web.config");
+        Info("passata 5/7: Web Forms e web.config");
         PassWebForms();
+        Info("passata 6/7: entry point non HTTP");
+        PassEntryPoints();
+        Info("passata 7/7: configurazione");
+        PassConfig();
 
         _g.Meta["prunedDanglingEdges"] = _g.PruneDanglingEdges();
         _g.Meta["log"] = _log.Take(500).ToList();
@@ -137,6 +146,8 @@ public sealed partial class Extractor(CodeGraph graph, string root, Options opt)
         n.Flag("generated", generated);
         AddAttributes(n, ts);
         AddDoc(n, ts);
+        AddProperties(n, ts);
+        if (ts.TypeKind == TypeKind.Class) RegisterMediatrHandlers(ts);
 
         _g.Edge("PRJ:" + p.Name, id, "CONTAINS");
         Link(Id(ts.ContainingType?.OriginalDefinition), id, "CONTAINS");
@@ -282,10 +293,11 @@ public sealed partial class Extractor(CodeGraph graph, string root, Options opt)
         if (from is not null && to is not null) _g.Edge(from, to, type, line);
     }
 
+    /// <summary>url = false per gli entry point senza URL (job, servizi, messaggi): l'id e' "VERBO nome" invece di "VERBO /percorso".</summary>
     private GraphNode AddRoute(string project, string flavor, List<string> verbs, string template, string controller, string action,
-                               List<string> auth, IEnumerable<string> handlers, string exposedBy)
+                               List<string> auth, IEnumerable<string> handlers, string exposedBy, bool url = true)
     {
-        var label = $"{string.Join("|", verbs)} /{template}";
+        var label = $"{string.Join("|", verbs)} {(url ? "/" : "")}{template}";
         var id = "R:" + label;
         for (int i = 2; _g.Has(id); i++) id = $"R:{label} #{i}";
         var n = _g.Node(id, "Route", label);
@@ -351,6 +363,27 @@ public sealed partial class Extractor(CodeGraph graph, string root, Options opt)
     {
         foreach (var name in s.GetAttributes().Select(a => a.AttrName()))
             if (name is not ("" or "CompilerGenerated" or "DebuggerStepThrough" or "GeneratedCode")) n.AddDistinct("attributes", name, 30);
+    }
+
+    /// <summary>
+    /// Proprieta' pubbliche con i loro attributi, come scritti nel codice: [Required], [StringLength(100)], [Range(0, 50000)],
+    /// [Column("...")]. Servono al dizionario dati e alle validazioni di DTO, ViewModel ed entita'.
+    /// </summary>
+    private void AddProperties(GraphNode n, INamedTypeSymbol ts)
+    {
+        if (ts.TypeKind is not (TypeKind.Class or TypeKind.Struct)) return;
+        foreach (var prop in ts.GetMembers().OfType<IPropertySymbol>())
+        {
+            if (prop.IsStatic || prop.IsIndexer || prop.DeclaredAccessibility != Accessibility.Public) continue;
+            var attrs = prop.GetAttributes().Select(a => a.ApplicationSyntaxReference?.GetSyntax().ToString() ?? a.AttrName())
+                .Where(a => a.Length > 0).Take(10).ToList();
+            var span = prop.Locations.FirstOrDefault(l => l.IsInSource)?.GetLineSpan();
+            n.AddItem("properties", new()
+            {
+                ["name"] = prop.Name, ["type"] = prop.Type.ToDisplayString(), ["attributes"] = attrs.Count > 0 ? attrs : null,
+                ["file"] = span is { } s1 ? Rel(s1.Path) : null, ["line"] = span is { } s2 ? s2.StartLinePosition.Line + 1 : null,
+            }, 150);
+        }
     }
 
     private static void AddDoc(GraphNode n, ISymbol s)

@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
 
 namespace Shop.Data
 {
@@ -13,6 +14,7 @@ namespace Shop.Data
 
     public class OrderLine
     {
+        [Range(1, 999, ErrorMessage = "Quantita' tra 1 e 999")]
         public int Quantity { get; set; }
         public decimal UnitPrice { get; set; }
     }
